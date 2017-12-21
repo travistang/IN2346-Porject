@@ -79,5 +79,15 @@ class MatplotlibVisualizer(Visualizer):
             if name == 'Dense':
                 # a fully connected layer
                 kernels, bias = weights
-                
-                
+                kernel_img = plt.imshow(kernels)
+            else: return
+        elif type(key) == 'str':
+            # try to find layers by name
+            layer = filter(lambda i,l: l.name == key,enumerate(self.model.layers))
+            if len(layer) == 0: return 
+            return self.visualize_weights(layer[0][0])
+        elif key is None:
+            for i in range(len(self.model.layers)):
+                self.visualize_weights(i)
+        
+            
