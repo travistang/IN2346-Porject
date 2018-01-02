@@ -1,6 +1,8 @@
 from keras.layers.recurrent import Recurrent
 from keras.engine.topology import Layer
 
+from weight import _get_weight
+
 class NTM(Layer):
     def __init__(self,
         output_dim,
@@ -64,47 +66,6 @@ class NTM(Layer):
         C = np.asarray([np.roll(eye, s, axis=1) for s in shifts])
         return K.variable(C.astype(K.floatx()))
 
-    '''
-        aux. functions for getting weights from head
-        The dimension of tensors are (supposed to be...):
-        M: (N,M)
-        k: (M,)
-        b: ()
-        g: ()
-        s: (num_shift,)
-        all weights: (N,)
-
-    '''
-    def _content_addressing(self,M,k,b):
-        sim = self._cos_sim(M,k)
-        mul = b * sim
-        return K.softmax(mul)
-
-    def _cos_sim(self,a,b):
-        na = K.l2_normalize(a)
-        nb = K.l2_normalize(b)
-        return K.dot(na,nb)
-
-    # eq. 7 of the paper
-    def _interpolate(self,wc,w,g):
-        return g * wc + (1 - g) * w
-
-    # eq. 8 of the paper
-    def _shift(self,wi,s):
-        # TODO: what now?!
-        pass
-    # eq. 9 of the paper
-    def _sharpen(self,ws,g):
-        pow = K.pow(ws,g)
-        return pow / (K.sum(pow) + 1e-12) # try not to divide by 0
-
-    # functions for getting weights from head
-    def _get_weight(self,M,w,k,b,g,s,t):
-        wc = self._content_addressing(M,k,b)
-        wi = self._interpolate(wc,w,g)
-        ws = self._shift(wi,s)
-        w_fin  = self._sharpen(ws,t)
-        return w_fin
 
     # weight construction
     def _construct_head_weights(self):
@@ -130,21 +91,47 @@ class NTM(Layer):
         # retrieve the old states
 
         # get the rest of the inputs
-        old_read_vectors, old_M = states
-        # TODO: i'm not sure how to work on multiple controller i/o tensors
-        # for inp in self.controller.inputs:
-        #     if inp.input
-        # controller_inputs = [inp for inp in self.controller.inputs if inp is not self.read_vector_input][0]
-        # controller_outputs = [oup for oup in self.controller.outputs if oup is not self.head_instruction_outputs][0]
+        '''
+            states:
+            [
+                [r1,r2,r3,...],
+                [rw1,rw2,rw3,...],
+                [ww1,ww2,ww3,...],
+                M
+            ]
+        '''
+        old_read_vectors,old_read_weights,old_write_weights,old_M = states
         # TODO: will this work?
-        controler_out, head_instrs = self.controller([inputs,old_read_vectors])
+        # chain the i/o of the controller to this graph
+        controller_out, head_instrs = self.controller([inputs,old_read_vectors])
 
         # evaluate the instructions according to internal weights
         head_instrs = K.dot(head_instrs,self.kernel) + self.bias
         # split the instructions
         read_heads,write_heads = self._split_head_instrutions(head_instrs)
-        read_heads = self._split_read_heads(read_heads)
-        write_heads = self._split_write_heads(write_heads)
+        # read_heads should be of the form [w1,w2,w3,....], each of size (batch_size,N)
+        read_heads = self._split_read_heads(old_M,old_read_vectors,read_heads)
+        # write_heads shuld be of th form [[w1,e1,a1],[w2,e2,a2],...], each w_i of size (batch_size,N), others of size(batch_size,k)
+        write_heads = self._split_write_heads(old_M,old_read_vectors,write_heads)
+
+        # erase
+        for w,e,a in write_heads:
+            M = self._erase_memory(M,w,e)
+        # add
+        for w,e,a in write_heads:
+            M = self._add_memory(M,w,a)
+        # read
+        next_read_vectors = []
+        for weight in read_heads:
+            rv = self._read_memory(M,weight)
+            next_read_vectors.append(rv)
+
+        # get only the weights of the write heads out
+        for i,(w,e,a) in enumerate(write_heads):
+            write_heads[i] = w
+
+        # return everything
+        return controller_out,[next_read_vectors,read_heads,write_heads]
 
     # head instructions interpretations
     def _split_head_instrutions(self,head_instrs):
@@ -153,9 +140,8 @@ class NTM(Layer):
         return head_instrs[:,:num_readhead_outs],head_instrs[:,num_readhead_outs:]
 
     # small loop for extracting params given a vector with shape (batch_size,3 + self.M + self.num_shift)
-    def _get_weight_vector(self,head):
+    def _get_weight_vector(self,M,w,head):
         cur = 0
-        head = read_heads_instrs[i:i + head_output_len]
         # split everything out
         k = head[:,cur:self.M]
         cur += self.M
@@ -177,22 +163,65 @@ class NTM(Layer):
         g = K.sigmoid(g)
         s = K.softmax(s)
         t = K.softplus(t) + 1
-        return [k,b,g,s,t]
 
-    def _split_read_heads(self,read_heads_instrs):
+        weight = _get_weight(M,w,k,b,g,s,t)
+        return weight
+
+    def _split_read_heads(self,M,ws,read_heads_instrs):
         res = []
         head_output_len = 3 + self.M + self.num_shift
         for i in range(0,self.num_read,head_output_len):
-            cur = 0 # ref to the index of the consumed outputs
-            head = read_heads_instrs[i:i + head_output_len]
+            head = read_heads_instrs[:,i:i + head_output_len]
 
-            head_params = self._get_weight_vector(head)
-            res.append(head_params)
+            weight = self._get_weight_vector(M,ws[i],head)
+            res.append(weight)
 
         return res
-    def _split_write_heads(self,write_heads_instrs):
+    def _split_write_heads(self,M,ws,write_heads_instrs):
         res = []
         head_output_len = 3 + self.M + self.num_shift + self.M + self.M
+        weight_len = 3 + self.M + self.num_shift
+        for i in range(0,self.num_write,head_output_len):
+            head = write_heads_instrs[:,i: i + head_output_len]
+            weight_head = head[:,:weight_len]
+
+            # get the writing weights specific to the particular old head
+            head_params = self._get_weight_vector(M,ws[i],weight_head)
+
+            erase_vec = head[:,weight_len:weight_len + self.M]
+            add_vec = head[:,weight_len + self.M : weight_len + self.M + self.M]
+
+            res.append([*head_params,erase_vec,add_vec])
+
+        return res
+
+    def _get_read_vector(self,M,w):
+        pass
+    '''
+        Add memory according to eq. 3 in (3.2)
+        M : (None,M,N)
+        w: (None, N)
+        e: (None, M)
+    '''
+    def _erase_memory(self,M,w,e):
+        ex = K.expand_dims(e,1) # (None,1,M)
+        wx = K.expand_dims(w,-1) # (None, N,1)
+        prod = K.batch_dot(wx,ex) # (None,N,M)
+        prod = 1 - prod # same shape
+        res = M * prod # (None,M,N)
+        return res
+
+    '''
+        Add memory according to eq. 4 in (3.2)
+        M : (None,M,N)
+        w: (None, N)
+        a: (None, M)
+    '''
+    def _add_memory(self,M,w,a):
+        ax = K.expand_dims(a,1) # (None,1,M)
+        wx = K.expand_dims(w,-1) # (None,N, 1)
+        prod = K.batch_dot(wx,ax) # (None, N,M)
+        return M + prod
 
     # overriding Recurrent layer functions
     def build(self,input_shape):
@@ -201,7 +230,7 @@ class NTM(Layer):
         self.bias = b
 
     def call(self,x):
-        return K.rnn(self.main_step_func,x,self.get_initial_states)
+        return K.rnn(self.main_step_func,x,self.get_initial_states())
 
     def get_initial_states(self):
         pass
