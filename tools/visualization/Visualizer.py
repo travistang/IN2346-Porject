@@ -1,12 +1,18 @@
 from keras.layers import *
 import matplotlib.pyplot as plt
 import keras.backend as K
+from keras.callbacks import Callback
 
 class Visualizer:
     def __init__(self,model):
+        assert(self.model.__class__.__name__ == "Model", "The model type has to be Model instead of Sequential or anything else")
         self.model = model
         # build Keras functions for evaluating gradient given input
         self.gradients = K.gradients(self.model.output,self.model.trainable_weights)
+        self.input_placeholder = self.model.input
+        layer_outputs = list(map(lambda l: l.output),self.model.layers)
+        # TODO: what if there are layers with multiple outputs?
+        self.outputs = K.function(self.input_placeholder,layer_outputs)
         
     def visualize_weights(self,key = None):
         return NotImplemented
@@ -89,5 +95,32 @@ class MatplotlibVisualizer(Visualizer):
         elif key is None:
             for i in range(len(self.model.layers)):
                 self.visualize_weights(i)
+    def visualize_activations(self,inp,key):
+        # TODO: does this work?
+        outputs = self.outputs(inp)
         
-            
+class VisualizeCallback(Callback):
+    def __init__(self,log_batch_interval,sample_generator, visualize_function_dict,**args):
+        super().__init__(**args)
+        self.interval = log_batch_interval
+        self.sample_generator = sample_generator
+        # accept the dictionary of visualization functions only when it matches the requirements
+        self._construct_visualize_function_dict(visualize_function_dict)
+        self.cur_batch = 0
+
+    def _construct_visualize_function_dict(self,func_dict):
+        if 'output' not in func_dict:
+            func_dict['output'] = K.function(self.model.input,self.model.output)
+    def on_batch_end(self,logs = {}):
+        self.cur_batch += 1
+        if self.cur_batch == self.interval:
+            self.cur_batch = 0
+            '''
+                #TODO:
+                1. get a sample from the generator
+                2. evaluate the function given the input,
+                3. evaluate th
+            '''
+    def on_epoch_end(self,logs = {}):
+        self.cur_batch = 0
+
