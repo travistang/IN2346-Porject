@@ -1,15 +1,16 @@
-from keras.layers.recurrent import Recurrent
 from keras.engine.topology import Layer
-
+from keras.models import Model
 from weight import _get_weight
+from keras.layers import *
 
 class NTM(Layer):
     def __init__(self,
-        output_dim,
         controller,                     # custom controller, should output a vector
         n_slots,mem_length,             # Memory config
-        num_shift = 1,                  # shifting
+        num_shift,                      # shifting
         num_read,num_write,             # controller-head config
+        batch_size = 16,
+        controller_instr_output_dim = None,
         **args):                        # others
 
         self.N = n_slots
@@ -21,59 +22,22 @@ class NTM(Layer):
 
         # deal with the given controller
         self.controller = controller
-        read_phs,instr_outs = self._check_controller()
-        self.read_vector_input = read_phs
-        self.head_instruction_outputs = instr_outs
 
-        self.C = self._circulant(self.n_slots, self.num_shft)
+        self.batch_size = batch_size
+        self.controller_instr_output_dim = controller_instr_output_dim
 
         super().__init__(**args)
-
-    def _check_controller(self):
-
-        if not self.controller:
-            raise ValueError("controller is empty")
-        try:
-            read_ph = self.controller.get_layer('read').input
-            instr_outs = self.controller.get_layer('head').output
-            return read_ph,instr_outs
-        except:
-            raise ValueError("The given controller should have two layers with name 'read' and 'head' respsectively")
-
-    # thanks for https://github.com/flomlo/ntm_keras/blob/fdfe3ff0e3f5d3e4bc1a2fe51afdf67dae3aa5d8/ntm.py#L26
-    def _circulant(self,leng, n_shifts):
-        # This is more or less the only code still left from the original author,
-        # EderSantan @ Github.
-        # My implementation would probably just be worse.
-        # Below his original comment:
-
-        """
-        I confess, I'm actually proud of this hack. I hope you enjoy!
-        This will generate a tensor with `n_shifts` of rotated versions the
-        identity matrix. When this tensor is multiplied by a vector
-        the result are `n_shifts` shifted versions of that vector. Since
-        everything is done with inner products, everything is differentiable.
-        Paramters:
-        ----------
-        leng: int > 0, number of memory locations
-        n_shifts: int > 0, number of allowed shifts (if 1, no shift)
-        Returns:
-        --------
-        shift operation, a tensor with dimensions (n_shifts, leng, leng)
-        """
-        eye = np.eye(leng)
-        shifts = range(n_shifts//2, -n_shifts//2, -1)
-        C = np.asarray([np.roll(eye, s, axis=1) for s in shifts])
-        return K.variable(C.astype(K.floatx()))
-
 
     # weight construction
     def _construct_head_weights(self):
         # evaluate the output for all heads
-        num_ouputs = self.num_read * (3 + self.M + self.num_shift) # b,g,t scalar, key strength (M,), shift (num_shift,)
-            + self.num_write * (3 + self.M + self.num_shift + self.M + self.M) # besides the weight vector,erase and add
+        # b,g,t scalar, key strength (M,), shift (num_shift,)
+        num_outputs = self.num_read * (3 + self.M + self.num_shift) + self.num_write * (3 + self.M + self.num_shift + self.M + self.M) # besides the weight vector,erase and add
         # create variables for the fully connected layers
-        controller_out_dim = self.controller.output.shape[-1]
+
+        controller_out_dim = self.controller_instr_output_dim
+        if not controller_out_dim:
+            controller_out_dim = self.controller.output[-1].shape[-1].value
 
         kernel = self.add_weight(name = 'heads_kernel',
                                 shape = (controller_out_dim,num_outputs),
@@ -85,6 +49,9 @@ class NTM(Layer):
                                 initializer = 'zero', # TODO: I should give you a choice...
                                 trainable = True)
         return kernel,bias
+
+    def _head_instruction_output_dim(self):
+        return self.num_read * (3 + self.M + self.num_shift) + self.num_write * (3 + self.M + self.num_shift + self.M + self.M)
 
     def main_step_func(self,inputs,states):
         # should return output,new_states
@@ -100,19 +67,21 @@ class NTM(Layer):
                 M
             ]
         '''
-        old_read_vectors,old_read_weights,old_write_weights,old_M = states
+        old_read_vectors,old_read_weights,old_write_weights,M = states
         # TODO: will this work?
         # chain the i/o of the controller to this graph
+        # controller_out, (batch,...),head_instrs: (batch,?)
         controller_out, head_instrs = self.controller([inputs,old_read_vectors])
 
         # evaluate the instructions according to internal weights
-        head_instrs = K.dot(head_instrs,self.kernel) + self.bias
+        # head_instrs: (batch, nr * (3 + ns + m) + nw * (3 + ns + m + 2m))
+        head_instrs = K.bias_add(K.dot(head_instrs,self.kernel), self.bias)
         # split the instructions
         read_heads,write_heads = self._split_head_instrutions(head_instrs)
         # read_heads should be of the form [w1,w2,w3,....], each of size (batch_size,N)
-        read_heads = self._split_read_heads(old_M,old_read_vectors,read_heads)
+        read_heads = self._split_read_heads(M,old_read_weights,read_heads)
         # write_heads shuld be of th form [[w1,e1,a1],[w2,e2,a2],...], each w_i of size (batch_size,N), others of size(batch_size,k)
-        write_heads = self._split_write_heads(old_M,old_read_vectors,write_heads)
+        write_heads = self._split_write_heads(M,old_write_weights,write_heads)
 
         # erase
         for w,e,a in write_heads:
@@ -131,7 +100,8 @@ class NTM(Layer):
             write_heads[i] = w
 
         # return everything
-        return controller_out,[next_read_vectors,read_heads,write_heads]
+        next_read_vectors = K.stack(next_read_vectors,axis = 1)
+        return controller_out,[next_read_vectors,read_heads,write_heads,M]
 
     # head instructions interpretations
     def _split_head_instrutions(self,head_instrs):
@@ -164,9 +134,18 @@ class NTM(Layer):
         s = K.softmax(s)
         t = K.softplus(t) + 1
 
-        weight = _get_weight(M,w,k,b,g,s,t)
+        # DEBUG-ing purpose:
+        # for _ in ['M','w','k','b','g','s','t']:
+        #     print(_,eval(_))
+
+        weight = _get_weight(M,w,k,b,g,s,t,self.N,self.num_shift)
         return weight
 
+    '''
+        M: (batch,N,M)
+        ws:(batch,num_read,N)
+        read_heads_instrs: (batch,num_read * (3 + M + num_shift) )
+    '''
     def _split_read_heads(self,M,ws,read_heads_instrs):
         res = []
         head_output_len = 3 + self.M + self.num_shift
@@ -177,6 +156,11 @@ class NTM(Layer):
             res.append(weight)
 
         return res
+    '''
+        M: (batch,N,M)
+        ws:(batch,num_read,M)
+        read_heads_instrs: (batch,num_read * (3 + M + num_shift) )
+    '''
     def _split_write_heads(self,M,ws,write_heads_instrs):
         res = []
         head_output_len = 3 + self.M + self.num_shift + self.M + self.M
@@ -186,17 +170,19 @@ class NTM(Layer):
             weight_head = head[:,:weight_len]
 
             # get the writing weights specific to the particular old head
-            head_params = self._get_weight_vector(M,ws[i],weight_head)
+            weight = self._get_weight_vector(M,ws[i],weight_head)
 
             erase_vec = head[:,weight_len:weight_len + self.M]
             add_vec = head[:,weight_len + self.M : weight_len + self.M + self.M]
 
-            res.append([*head_params,erase_vec,add_vec])
+            res.append([weight,erase_vec,add_vec])
 
         return res
 
-    def _get_read_vector(self,M,w):
-        pass
+    def _read_memory(self,M,w):
+        Ms = K.permutate_dimensions(M,(0,2,1))
+        res = K.batch_dot(Ms,w)
+        return res
     '''
         Add memory according to eq. 3 in (3.2)
         M : (None,M,N)
@@ -229,8 +215,54 @@ class NTM(Layer):
         self.kernel = k
         self.bias = b
 
-    def call(self,x):
-        return K.rnn(self.main_step_func,x,self.get_initial_states())
+    def compute_output_shape(self, input_shape):
+        return self.controller.compute_output_shape(input_shape)
 
-    def get_initial_states(self):
-        pass
+    def call(self,x):
+        return K.rnn(self.main_step_func,x,self.get_initial_states(x))
+
+    def get_initial_states(self,x):
+        batch_size = self.batch_size
+        # old_read_vectors,old_read_weights,old_write_weights,old_M
+        read_vectors = [K.zeros((batch_size,self.M)) for i in range(self.num_read)]
+        read_weights = [K.zeros((batch_size,self.N)) for i in range(self.num_read)]
+        write_weights = [K.zeros((batch_size,self.N)) for i in range(self.num_write)]
+        # # TODO: memory initializations?
+        M = K.zeros((batch_size,self.N,self.M))
+
+        read_vectors = K.stack(read_vectors,axis = 1)
+        return [read_vectors,read_weights,write_weights,M]
+
+from keras.models import Model
+if __name__ == '__main__':
+    seq_len = 40
+    num_bits = 8
+
+    num_read = 2
+    num_write = 3
+
+    num_slots = 128
+    mem_length = num_bits
+    batch_size = 16
+
+    controller_instr_output_dim = num_bits + num_read * mem_length
+    # controller
+    i = Input((num_bits,))
+    read_input = Input((num_read,mem_length))
+    read_input_flatten = Flatten()(read_input)
+    h = Dense(num_bits)(i)
+    h2 = Concatenate()([h,read_input_flatten])
+    controller_out = Dense(num_bits,activation = 'sigmoid')(h2)
+    controller = Model([i,read_input],[controller_out,h2])
+
+    # NTM
+    i = Input((seq_len,num_bits))
+    ntm_cell = NTM(
+            controller,                     # custom controller, should output a vector
+            num_slots,mem_length,           # Memory config
+            num_shift = 3,                  # shifting
+            batch_size = batch_size,
+            controller_instr_output_dim = controller_instr_output_dim,
+            num_read = num_read,num_write = num_write)(i)
+    ntm = Model(i,ntm_cell)
+    ntm.summary()
