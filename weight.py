@@ -54,33 +54,22 @@ def _interpolate(wc,w,g):
     n:  N (n_slots)
     num_shift: length of shifting kernel
 '''
-def _shift(wi,s,n,num_shift):
+def _shift(wi,s):
     if DEBUG:
         assert type(n) == type(num_shift) == int
         assert K.ndim(wi) == 2 == K.ndim(s)
+    num_shift = s.shape[-1].value
 
-    wix = K.expand_dims(wi,axis = -1)       # (batch,N,1)
-    wix = K.expand_dims(wix,axis = -1)      # (batch,N,1,1)
-    if DEBUG:
-        print('wix',wix)
-    res = [K.zeros((wix.shape[0],1)) for i in range(n)]   # N * (batch,1)
-    st = [K.expand_dims(s[:,i],-1) for i in range(num_shift)] # num_shift * (batch,1)
-    if DEBUG:
-        print(res,st)
-    # TODO: can this be any faster?
-    # (faithfully) following the eq. 8 in section 3.3.2
-    for i in range(n):
-        for j in range(n):
-            w = wix[:,j,:,:]                                        # (batch,1,1)
-            si = st[(i - j) % num_shift]                            # (batch,1)
-            res[i] += K.batch_dot(w,si)  # (bat)
-    if DEBUG:
-        print('res',res)
-    res = K.stack(res,axis = 1)                    # (batch,N,1)
-    res = res[:,:,0]                               # (batch,N)
-    if DEBUG:
-        print('res',res)
-    return res
+    bound = num_shift // 2
+    head,tail = wi[:,:bound],wi[:,-bound:]
+    wi = K.concatenate([tail,wi,head])
+    wix = K.expand_dims(wi,1)              # (batch,1,N + num_shift)
+
+    st = K.permute_dimensions(s,(1,0))     # (num_shift,batch)
+    sx = K.expand_dims(st,1)               # (num_shift,1,batch)
+    wix = K.permute_dimensions(wix,(0,2,1)) # (batch,N + num_shift,1)
+    res = K.conv1d(wix,sx,data_format = 'channels_last')                 # (batch,N,batch)
+    return K.stack([res[_,:,_] for _ in range(res.shape[0].value)])
 
 # eq. 9 of the paper
 def _sharpen(ws,g):
@@ -102,22 +91,27 @@ def _get_weight(M,w,k,b,g,s,t,n,num_shift):
     return w_fin
 
 if __name__ == '__main__':
+    import numpy as np
     # unit testing playground
-    batch = 100
-    n = 10
-    m = 20
-    num_shift = 3
+    # batch = 100
+    # n = 10
+    # m = 20
+    # num_shift = 3
 
-    M = K.ones((batch,n,m))
-    k = K.ones((batch,m))
-    b = K.ones((batch,))
-    g = K.ones((batch,))
-    w = K.ones((batch,n))
-    s = K.ones((batch,num_shift)) * 0.5
-    t = K.zeros((batch,))
-    ca = _content_addressing(M,k,b)
-    wg = _interpolate(ca,w,g)
-    ws = _shift(wg,s,n,num_shift)
-    w_fin = _sharpen(ws,t)
+    # M = K.ones((batch,n,m))
+    # k = K.ones((batch,m))
+    # b = K.ones((batch,))
+    # g = K.ones((batch,))
+    # w = K.ones((batch,n))
+    # s = K.ones((batch,num_shift)) * 0.5
+    # t = K.zeros((batch,))
+    # ca = _content_addressing(M,k,b)
+    # wg = _interpolate(ca,w,g)
+    # ws = _shift(wg,s)
+    # w_fin = _sharpen(ws,t)
+    # with K.get_session().as_default():
+    #     print(w_fin.eval())
+    a = K.stack([K.variable(np.arange(_,10 + _,1)) for _ in range(5)])
+    s = K.stack([K.variable([1. + _,0,0]) for _ in range(5)])
     with K.get_session().as_default():
-        print(w_fin.eval())
+        print(_shift(a,s).eval())
