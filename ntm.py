@@ -236,8 +236,6 @@ class NTM(Layer):
 
     def call(self,x):
         last_output,list_outputs,states = K.rnn(self.main_step_func,x,self.get_initial_states(x))
-        print('last_output',last_output)
-        print('list_outputs',list_outputs)
         return last_output if not self.return_sequences else list_outputs
 
     def get_initial_states(self,x):
@@ -262,8 +260,8 @@ if __name__ == '__main__':
     seq_len = 2 * max_len + 1
     num_bits = 8
 
-    num_read = 2
-    num_write = 3
+    num_read = 1
+    num_write = 1
 
     num_slots = 128
     mem_length = num_bits
@@ -274,8 +272,8 @@ if __name__ == '__main__':
     i = Input((num_bits,))
     read_input = Input((num_read,mem_length))
     read_input_flatten = Flatten()(read_input)
-    h = Dense(num_bits,activation = 'relu')(i)
-    h2 = Concatenate()([h,read_input_flatten])
+    h = Concatenate()([i,read_input_flatten])
+    h2 = Dense(100,activation = 'relu')(h)
     controller_out = Dense(num_bits,activation = 'sigmoid')(h2)
     controller = Model([i,read_input],[controller_out,h2])
     controller.summary()
@@ -286,7 +284,7 @@ if __name__ == '__main__':
             num_slots,mem_length,           # Memory config
             num_shift = 3,                  # shifting
             batch_size = batch_size,
-            controller_instr_output_dim = controller_instr_output_dim,
+            #controller_instr_output_dim = controller_instr_output_dim,
             return_sequences = True,
             num_read = num_read,num_write = num_write)(i)
     ntm = Model(i,ntm_cell)
@@ -313,7 +311,7 @@ if __name__ == '__main__':
     import sys
     ntm.compile(loss = 'binary_crossentropy',
         metrics = ['binary_accuracy'],
-        optimizer = Adam(1e-4,clipnorm = 10.),
+        optimizer = Adam(1e-3,clipnorm = 10.),
         sample_weight_mode = 'temporal')
     epochs = 100
     steps = 500
