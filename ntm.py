@@ -257,15 +257,17 @@ class NTM(Layer):
 
 from keras.models import Model
 if __name__ == '__main__':
-    seq_len = 41
-    num_bits = 9
+    min_len = 1
+    max_len = 10
+    seq_len = 2 * max_len + 1
+    num_bits = 8
 
     num_read = 2
     num_write = 3
 
     num_slots = 128
     mem_length = num_bits
-    batch_size = 16
+    batch_size = 4
 
     controller_instr_output_dim = num_bits + num_read * mem_length
     # controller
@@ -307,21 +309,39 @@ if __name__ == '__main__':
                 output[bs,l,-1] = 1.
                 mask[bs,l + 1: 2 * l + 1] = 1.
             yield (res,output,mask)
-    from keras.optimizers import RMSprop
+    from keras.optimizers import RMSprop,Adam
     import sys
     ntm.compile(loss = 'binary_crossentropy',
         metrics = ['binary_accuracy'],
-        optimizer = RMSprop(1e-4),
+        optimizer = Adam(1e-4,clipnorm = 10.,decay = 1e-7),
         sample_weight_mode = 'temporal')
     epochs = 100
     steps = 500
-    data_gen = copy_task_generator()
-    for epoch in range(epochs):
-        print()
-        print('Epoch {}/{}:'.format(epoch,epochs))
-        inp,target,mask = data_gen.__next__()
-        for step in range(steps):
-            loss,acc = ntm.train_on_batch(inp,target,sample_weight = mask)
-            sys.stdout.write('\rstep %d/%d,loss:%.6g,acc:%.6g'%(step,steps,loss,acc))
-            sys.stdout.flush()
-        print()
+    data_gen = copy_task_generator(
+        num_bits = num_bits - 1,
+        min_len = min_len,
+        max_len = max_len,
+        batch_size = batch_size)
+    try:
+        for epoch in range(epochs):
+            print()
+            print('Epoch {}/{}:'.format(epoch,epochs))
+            for step in range(steps):
+                inp,target,mask = data_gen.__next__()
+                loss,acc = ntm.train_on_batch(inp,target,sample_weight = mask)
+                sys.stdout.write('\rstep %d/%d,loss:%.6g,acc:%.6g'%(step,steps,loss,acc))
+                sys.stdout.flush()
+            print()
+            test_inp,test_target,test_mask = data_gen.__next__()
+            output = ntm.predict(test_inp)
+            # get the first batch
+            test_inp = test_inp[0]
+            output = output[0]
+            test_target = test_target[0]
+            # save the tensor
+            np.save('epoch_{}-input',test_inp)
+            np.save('epoch_{}-output',output)
+            np.save('epoch_{}-target',test_target)
+    except KeyboardInterrupt:
+        ntm.save('ntm.h5')
+        controller.save('controller.h5')
