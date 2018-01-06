@@ -267,7 +267,7 @@ if __name__ == '__main__':
 
     num_slots = 128
     mem_length = num_bits
-    batch_size = 128
+    batch_size = 4
 
     controller_instr_output_dim = num_bits + num_read * mem_length
     # controller
@@ -313,7 +313,7 @@ if __name__ == '__main__':
     import sys
     ntm.compile(loss = 'binary_crossentropy',
         metrics = ['binary_accuracy'],
-        optimizer = Adam(1e-3,clipnorm = 10.,decay = 1e-7),
+        optimizer = Adam(1e-4,clipnorm = 10.),
         sample_weight_mode = 'temporal')
     epochs = 100
     steps = 500
@@ -322,6 +322,9 @@ if __name__ == '__main__':
         min_len = min_len,
         max_len = max_len,
         batch_size = batch_size)
+    # for visualizations
+    grad = K.gradients(ntm.outputs[0],controller.trainable_weights)
+
     try:
         for epoch in range(epochs):
             print()
@@ -329,11 +332,11 @@ if __name__ == '__main__':
             for step in range(steps):
                 inp,target,mask = data_gen.__next__()
                 loss,acc = ntm.train_on_batch(inp,target,sample_weight = mask)
-                sys.stdout.write('\rstep %d/%d,loss:%.6g,acc:%.6g'%(step,steps,loss,acc))
+                sys.stdout.write('\rstep %d/%d,loss:%.4g,acc:%.4g'%(step,steps,loss,acc))
                 sys.stdout.flush()
             print()
             test_inp,test_target,test_mask = data_gen.__next__()
-            output = ntm.predict(test_inp)
+            output = ntm.predict(test_inp,batch_size = batch_size)
             # get the first batch
             test_inp = test_inp[0]
             output = output[0]
