@@ -26,6 +26,11 @@ class NTM(Layer):
         self.batch_size = batch_size
         self.controller_instr_output_dim = controller_instr_output_dim
 
+        if 'return_sequences' in args:
+            self.return_sequences = args['return_sequences']
+            del args['return_sequences']
+        else:
+            self.return_sequences = False
         super().__init__(**args)
 
     # weight construction
@@ -101,6 +106,8 @@ class NTM(Layer):
 
         # return everything
         next_read_vectors = K.stack(next_read_vectors,axis = 1)
+        read_heads = K.stack(read_heads,axis = 1)
+        write_heads = K.stack(write_heads,axis = 1)
         return controller_out,[next_read_vectors,read_heads,write_heads,M]
 
     # head instructions interpretations
@@ -138,7 +145,7 @@ class NTM(Layer):
         # for _ in ['M','w','k','b','g','s','t']:
         #     print(_,eval(_))
 
-        weight = _get_weight(M,w,k,b,g,s,t,self.N,self.num_shift)
+        weight = _get_weight(M,w,k,b,g,s,t)
         return weight
 
     '''
@@ -149,10 +156,10 @@ class NTM(Layer):
     def _split_read_heads(self,M,ws,read_heads_instrs):
         res = []
         head_output_len = 3 + self.M + self.num_shift
-        for i in range(0,self.num_read,head_output_len):
-            head = read_heads_instrs[:,i:i + head_output_len]
+        for i in range(self.num_read):
+            head = read_heads_instrs[:,i * head_output_len:(i + 1) * head_output_len]
 
-            weight = self._get_weight_vector(M,ws[i],head)
+            weight = self._get_weight_vector(M,ws[:,i,:],head)
             res.append(weight)
 
         return res
@@ -165,12 +172,12 @@ class NTM(Layer):
         res = []
         head_output_len = 3 + self.M + self.num_shift + self.M + self.M
         weight_len = 3 + self.M + self.num_shift
-        for i in range(0,self.num_write,head_output_len):
-            head = write_heads_instrs[:,i: i + head_output_len]
+        for i in range(self.num_write):
+            head = write_heads_instrs[:,i * head_output_len : (i + 1) * head_output_len]
             weight_head = head[:,:weight_len]
 
             # get the writing weights specific to the particular old head
-            weight = self._get_weight_vector(M,ws[i],weight_head)
+            weight = self._get_weight_vector(M,ws[:,i,:],weight_head)
 
             erase_vec = head[:,weight_len:weight_len + self.M]
             add_vec = head[:,weight_len + self.M : weight_len + self.M + self.M]
@@ -180,7 +187,7 @@ class NTM(Layer):
         return res
 
     def _read_memory(self,M,w):
-        Ms = K.permutate_dimensions(M,(0,2,1))
+        Ms = K.permute_dimensions(M,(0,2,1))
         res = K.batch_dot(Ms,w)
         return res
     '''
@@ -216,27 +223,42 @@ class NTM(Layer):
         self.bias = b
 
     def compute_output_shape(self, input_shape):
-        return self.controller.compute_output_shape(input_shape)
+        seq_len = input_shape[1]
+        read_vector_input_shape = (input_shape[0],self.num_read,self.M)
+        controller_output_shape, _ = self.controller.compute_output_shape([input_shape,read_vector_input_shape])
+
+        if not self.return_sequences:
+            controller_output_shape = list(controller_output_shape)
+            del controller_output_shape[1]
+            controller_output_shape = tuple(controller_output_shape)
+
+        return controller_output_shape
 
     def call(self,x):
-        return K.rnn(self.main_step_func,x,self.get_initial_states(x))
+        last_output,list_outputs,states = K.rnn(self.main_step_func,x,self.get_initial_states(x))
+        print('last_output',last_output)
+        print('list_outputs',list_outputs)
+        return last_output if not self.return_sequences else list_outputs
 
     def get_initial_states(self,x):
         batch_size = self.batch_size
         # old_read_vectors,old_read_weights,old_write_weights,old_M
         read_vectors = [K.zeros((batch_size,self.M)) for i in range(self.num_read)]
-        read_weights = [K.zeros((batch_size,self.N)) for i in range(self.num_read)]
-        write_weights = [K.zeros((batch_size,self.N)) for i in range(self.num_write)]
+        # read_weights = [K.zeros((batch_size,self.N)) for i in range(self.num_read)]
+        read_weights = K.zeros((batch_size,self.num_read,self.N))
+        # write_weights = [K.zeros((batch_size,self.N)) for i in range(self.num_write)]
+        write_weights = K.zeros((batch_size,self.num_write,self.N))
         # # TODO: memory initializations?
         M = K.zeros((batch_size,self.N,self.M))
 
         read_vectors = K.stack(read_vectors,axis = 1)
+
         return [read_vectors,read_weights,write_weights,M]
 
 from keras.models import Model
 if __name__ == '__main__':
-    seq_len = 40
-    num_bits = 8
+    seq_len = 41
+    num_bits = 9
 
     num_read = 2
     num_write = 3
@@ -250,11 +272,11 @@ if __name__ == '__main__':
     i = Input((num_bits,))
     read_input = Input((num_read,mem_length))
     read_input_flatten = Flatten()(read_input)
-    h = Dense(num_bits)(i)
+    h = Dense(num_bits,activation = 'relu')(i)
     h2 = Concatenate()([h,read_input_flatten])
     controller_out = Dense(num_bits,activation = 'sigmoid')(h2)
     controller = Model([i,read_input],[controller_out,h2])
-
+    controller.summary()
     # NTM
     i = Input((seq_len,num_bits))
     ntm_cell = NTM(
@@ -263,6 +285,43 @@ if __name__ == '__main__':
             num_shift = 3,                  # shifting
             batch_size = batch_size,
             controller_instr_output_dim = controller_instr_output_dim,
+            return_sequences = True,
             num_read = num_read,num_write = num_write)(i)
     ntm = Model(i,ntm_cell)
-    ntm.summary()
+
+    print("****************** Start Training *****************")
+    def copy_task_generator(batch_size = 16,min_len = 1,max_len = 20,num_bits = 8):
+        while True:
+            res = np.zeros((batch_size,max_len * 2 + 1,num_bits + 1))
+            output = np.zeros((batch_size,max_len * 2 + 1,num_bits + 1))
+            mask = np.zeros((batch_size,max_len * 2 + 1))
+            for bs in range(batch_size):
+                l = np.random.randint(min_len,max_len + 1)
+                for i in range(l):
+                    for j in range(num_bits):
+                        res[bs,i,j] = np.random.randint(2)
+                # delim flag
+                res[bs,l,num_bits] = 1.
+                # output = np.zeros((max_len * 2 + 1, num_bits + 1))
+                output[bs,l + 1:2 * l + 1,:] = res[bs,:l,:]
+                output[bs,l,-1] = 1.
+                mask[bs,l + 1: 2 * l + 1] = 1.
+            yield (res,output,mask)
+    from keras.optimizers import RMSprop
+    import sys
+    ntm.compile(loss = 'binary_crossentropy',
+        metrics = ['binary_accuracy'],
+        optimizer = RMSprop(1e-4),
+        sample_weight_mode = 'temporal')
+    epochs = 100
+    steps = 500
+    data_gen = copy_task_generator()
+    for epoch in range(epochs):
+        print()
+        print('Epoch {}/{}:'.format(epoch,epochs))
+        inp,target,mask = data_gen.__next__()
+        for step in range(steps):
+            loss,acc = ntm.train_on_batch(inp,target,sample_weight = mask)
+            sys.stdout.write('\rstep %d/%d,loss:%.6g,acc:%.6g'%(step,steps,loss,acc))
+            sys.stdout.flush()
+        print()

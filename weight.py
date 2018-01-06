@@ -83,10 +83,10 @@ def _sharpen(ws,g):
     return pow / (K.sum(pow,axis = -1,keepdims = True) + 1e-12) # try not to divide by 0
 
 # functions for getting weights from head
-def _get_weight(M,w,k,b,g,s,t,n,num_shift):
+def _get_weight(M,w,k,b,g,s,t):
     wc = _content_addressing(M,k,b)
     wi = _interpolate(wc,w,g)
-    ws = _shift(wi,s,n,num_shift)
+    ws = _shift(wi,s)
     w_fin  = _sharpen(ws,t)
     return w_fin
 
