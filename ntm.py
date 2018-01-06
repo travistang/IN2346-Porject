@@ -267,7 +267,7 @@ if __name__ == '__main__':
 
     num_slots = 128
     mem_length = num_bits
-    batch_size = 4
+    batch_size = 128
 
     controller_instr_output_dim = num_bits + num_read * mem_length
     # controller
@@ -313,7 +313,7 @@ if __name__ == '__main__':
     import sys
     ntm.compile(loss = 'binary_crossentropy',
         metrics = ['binary_accuracy'],
-        optimizer = Adam(1e-4,clipnorm = 10.,decay = 1e-7),
+        optimizer = Adam(1e-3,clipnorm = 10.,decay = 1e-7),
         sample_weight_mode = 'temporal')
     epochs = 100
     steps = 500
@@ -339,9 +339,9 @@ if __name__ == '__main__':
             output = output[0]
             test_target = test_target[0]
             # save the tensor
-            np.save('epoch_{}-input',test_inp)
-            np.save('epoch_{}-output',output)
-            np.save('epoch_{}-target',test_target)
+            np.save('epoch_{}-input'.format(epoch),test_inp)
+            np.save('epoch_{}-output'.format(epoch),output)
+            np.save('epoch_{}-target'.format(epoch),test_target)
     except KeyboardInterrupt:
         ntm.save('ntm.h5')
         controller.save('controller.h5')
