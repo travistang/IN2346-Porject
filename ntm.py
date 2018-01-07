@@ -236,8 +236,13 @@ class NTM(Layer):
 
     def call(self,x):
         last_output,list_outputs,states = K.rnn(self.main_step_func,x,self.get_initial_states(x))
+        # plot the states
+        self.save_states(states)
         return last_output if not self.return_sequences else list_outputs
 
+    def save_states(self,states):
+        read_vectors,read_weights,write_weights,M = states
+        
     def get_initial_states(self,x):
         batch_size = self.batch_size
         # old_read_vectors,old_read_weights,old_write_weights,old_M
@@ -247,7 +252,10 @@ class NTM(Layer):
         # write_weights = [K.zeros((batch_size,self.N)) for i in range(self.num_write)]
         write_weights = K.zeros((batch_size,self.num_write,self.N))
         # # TODO: memory initializations?
-        M = K.zeros((batch_size,self.N,self.M))
+        #M = np.random.rand(batch_size,self.N,self.M)/ 100.
+        M = np.zeros((batch_size,self.N,self.M))
+        M[:,self.N // 2,:] = np.ones((batch_size,self.M))
+        M = K.variable(M)
 
         read_vectors = K.stack(read_vectors,axis = 1)
 
@@ -273,7 +281,7 @@ if __name__ == '__main__':
     read_input = Input((num_read,mem_length))
     read_input_flatten = Flatten()(read_input)
     h = Concatenate()([i,read_input_flatten])
-    h2 = Dense(100,activation = 'relu')(h)
+    h2 = Dense(100,activation = 'tanh')(h)
     controller_out = Dense(num_bits,activation = 'sigmoid')(h2)
     controller = Model([i,read_input],[controller_out,h2])
     controller.summary()
@@ -288,7 +296,6 @@ if __name__ == '__main__':
             return_sequences = True,
             num_read = num_read,num_write = num_write)(i)
     ntm = Model(i,ntm_cell)
-
     print("****************** Start Training *****************")
     def copy_task_generator(batch_size = 16,min_len = 1,max_len = 20,num_bits = 8):
         while True:
@@ -311,7 +318,7 @@ if __name__ == '__main__':
     import sys
     ntm.compile(loss = 'binary_crossentropy',
         metrics = ['binary_accuracy'],
-        optimizer = Adam(1e-3,clipnorm = 10.),
+        optimizer = Adam(1e-3,clipnorm = 1.),
         sample_weight_mode = 'temporal')
     epochs = 100
     steps = 500
@@ -325,11 +332,17 @@ if __name__ == '__main__':
 
     try:
         for epoch in range(epochs):
+            total_loss = 0.
+            total_acc = 0.
             print()
             print('Epoch {}/{}:'.format(epoch,epochs))
             for step in range(steps):
                 inp,target,mask = data_gen.__next__()
                 loss,acc = ntm.train_on_batch(inp,target,sample_weight = mask)
+                total_loss += loss
+                total_acc += acc
+                loss = total_loss / (1 + step)
+                acc = total_acc / (1 + step)
                 sys.stdout.write('\rstep %d/%d,loss:%.4g,acc:%.4g'%(step,steps,loss,acc))
                 sys.stdout.flush()
             print()
@@ -339,10 +352,12 @@ if __name__ == '__main__':
             test_inp = test_inp[0]
             output = output[0]
             test_target = test_target[0]
+            test_mask = test_mask[0]
             # save the tensor
             np.save('epoch_{}-input'.format(epoch),test_inp)
             np.save('epoch_{}-output'.format(epoch),output)
             np.save('epoch_{}-target'.format(epoch),test_target)
+            np.save('epoch_{}-mask'.format(epoch),test_mask)
     except KeyboardInterrupt:
         ntm.save('ntm.h5')
         controller.save('controller.h5')
