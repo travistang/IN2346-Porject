@@ -1,5 +1,5 @@
 from keras.engine.topology import Layer
-from keras.models import Model
+from keras.models import Model,load_model
 from weight import _get_weight
 from keras.layers import *
 
@@ -25,7 +25,7 @@ class NTM(Layer):
 
         self.batch_size = batch_size
         self.controller_instr_output_dim = controller_instr_output_dim
-
+        
         if 'return_sequences' in args:
             self.return_sequences = args['return_sequences']
             del args['return_sequences']
@@ -235,6 +235,8 @@ class NTM(Layer):
         return controller_output_shape
 
     def call(self,x):
+        # add the weights here
+        self.trainable_weights += self.controller.trainable_weights
         last_output,list_outputs,states = K.rnn(self.main_step_func,x,self.get_initial_states(x))
         # plot the states
         self.save_states(states)
@@ -262,9 +264,10 @@ class NTM(Layer):
         return [read_vectors,read_weights,write_weights,M]
 
 from keras.models import Model
+import csv
 if __name__ == '__main__':
-    min_len = 1
-    max_len = 10
+    min_len = 90
+    max_len = 90
     seq_len = 2 * max_len + 1
     num_bits = 8
 
@@ -285,6 +288,7 @@ if __name__ == '__main__':
     controller_out = Dense(num_bits,activation = 'sigmoid')(h2)
     controller = Model([i,read_input],[controller_out,h2])
     controller.summary()
+    
     # NTM
     i = Input((seq_len,num_bits))
     ntm_cell = NTM(
@@ -318,9 +322,9 @@ if __name__ == '__main__':
     import sys
     ntm.compile(loss = 'binary_crossentropy',
         metrics = ['binary_accuracy'],
-        optimizer = Adam(1e-3,clipnorm = 1.),
+        optimizer = RMSprop(1e-3,clipnorm = 1.),
         sample_weight_mode = 'temporal')
-    epochs = 100
+    epochs = 200
     steps = 500
     data_gen = copy_task_generator(
         num_bits = num_bits - 1,
@@ -328,36 +332,55 @@ if __name__ == '__main__':
         max_len = max_len,
         batch_size = batch_size)
     # for visualizations
-    grad = K.gradients(ntm.outputs[0],controller.trainable_weights)
-
+    #grad = K.gradients(ntm.outputs[0],controller.trainable_weights)
+ 
+    finetune = True
+    # load the weights
+    if finetune:
+        print('loading models')
+        ntm.load_weights('ntm_weights.h5')
+        controller = load_model('controller.h5')
     try:
-        for epoch in range(epochs):
-            total_loss = 0.
-            total_acc = 0.
-            print()
-            print('Epoch {}/{}:'.format(epoch,epochs))
-            for step in range(steps):
-                inp,target,mask = data_gen.__next__()
-                loss,acc = ntm.train_on_batch(inp,target,sample_weight = mask)
-                total_loss += loss
-                total_acc += acc
-                loss = total_loss / (1 + step)
-                acc = total_acc / (1 + step)
-                sys.stdout.write('\rstep %d/%d,loss:%.4g,acc:%.4g'%(step,steps,loss,acc))
-                sys.stdout.flush()
-            print()
-            test_inp,test_target,test_mask = data_gen.__next__()
-            output = ntm.predict(test_inp,batch_size = batch_size)
-            # get the first batch
-            test_inp = test_inp[0]
-            output = output[0]
-            test_target = test_target[0]
-            test_mask = test_mask[0]
-            # save the tensor
-            np.save('epoch_{}-input'.format(epoch),test_inp)
-            np.save('epoch_{}-output'.format(epoch),output)
-            np.save('epoch_{}-target'.format(epoch),test_target)
-            np.save('epoch_{}-mask'.format(epoch),test_mask)
+        with open('log.csv','w') as csvf:
+            csv_writer = csv.writer(csvf)
+            for epoch in range(epochs):
+                total_loss = 0.
+                total_acc = 0.
+                print()
+                print('Epoch {}/{}:'.format(epoch,epochs))
+                for step in range(steps):
+                    inp,target,mask = data_gen.__next__()
+                    if finetune:
+                        loss,acc = ntm.evaluate(inp,target,sample_weight = mask)
+                    else:
+                        loss,acc = ntm.train_on_batch(inp,target,sample_weight = mask)
+                    total_loss += loss
+                    total_acc += acc
+                    loss = total_loss / (1 + step)
+                    acc = total_acc / (1 + step)
+                    sys.stdout.write('\rstep %d/%d,loss:%.4g,acc:%.4g,lr: %f'%(step,steps,loss,acc,K.get_value(ntm.optimizer.lr)))
+                    sys.stdout.flush()
+                    
+                    # write csv
+                    csv_writer.writerow([epoch,step,loss,acc])
+                print()
+                test_inp,test_target,test_mask = data_gen.__next__()
+                output = ntm.predict(test_inp,batch_size = batch_size)
+                # get the first batch
+                test_inp = test_inp[0]
+                output = output[0]
+                test_target = test_target[0]
+                test_mask = test_mask[0]
+                
+                # save the tensor
+                prefix = '' if not finetune else 'evaluate-'
+                np.save('{}epoch_{}-input'.format(prefix,epoch),test_inp)
+                np.save('{}epoch_{}-output'.format(prefix,epoch),output)
+                np.save('{}epoch_{}-target'.format(prefix,epoch),test_target)
+                np.save('{}epoch_{}-mask'.format(prefix,epoch),test_mask)
     except KeyboardInterrupt:
-        ntm.save('ntm.h5')
-        controller.save('controller.h5')
+        pass
+    finally:
+        if not finetune:
+            ntm.save_weights('ntm_weights.h5')
+            controller.save('controller.h5')    
