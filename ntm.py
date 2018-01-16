@@ -11,6 +11,7 @@ class NTM(Layer):
         num_read,num_write,             # controller-head config
         batch_size = 16,
         controller_instr_output_dim = None,
+        is_controller_recurrent = False,
         **args):                        # others
 
         self.N = n_slots
@@ -26,6 +27,8 @@ class NTM(Layer):
         self.batch_size = batch_size
         self.controller_instr_output_dim = controller_instr_output_dim
         
+        self.is_controller_recurrent = is_controller_recurrent
+
         if 'return_sequences' in args:
             self.return_sequences = args['return_sequences']
             del args['return_sequences']
@@ -232,6 +235,12 @@ class NTM(Layer):
             del controller_output_shape[1]
             controller_output_shape = tuple(controller_output_shape)
 
+        if self.is_controller_recurrent:
+            controller_output_shape = list(controller_output_shape)
+            controller_output_shape.insert(1,seq_len)
+            controller_output_shape = tuple(controller_output_shape)
+
+        print('controller_output_shape',controller_output_shape)
         return controller_output_shape
 
     def call(self,x):
@@ -266,8 +275,8 @@ class NTM(Layer):
 from keras.models import Model
 import csv
 if __name__ == '__main__':
-    min_len = 90
-    max_len = 90
+    min_len = 1
+    max_len = 20
     seq_len = 2 * max_len + 1
     num_bits = 8
 
@@ -279,16 +288,26 @@ if __name__ == '__main__':
     batch_size = 4
 
     controller_instr_output_dim = num_bits + num_read * mem_length
-    # controller
+    # flat controller
     i = Input((num_bits,))
     read_input = Input((num_read,mem_length))
     read_input_flatten = Flatten()(read_input)
     h = Concatenate()([i,read_input_flatten])
     h2 = Dense(100,activation = 'tanh')(h)
     controller_out = Dense(num_bits,activation = 'sigmoid')(h2)
-    controller = Model([i,read_input],[controller_out,h2])
-    controller.summary()
+    flat_controller = Model([i,read_input],[controller_out,h2])
+    flat_controller.summary()
     
+    # rnn controller
+    i = Input((num_bits,),batch_shape = (batch_size, num_bits))
+    read_input = Input((num_read,mem_length),batch_shape = (batch_size,num_read,mem_length))
+    read_input_flatten = Flatten()(read_input)
+    h = Concatenate()([i,read_input_flatten])
+    h = RepeatVector(1)(h)
+    h2,instr_out,_ = LSTM(100,return_sequences = True,return_state = True)(h)
+    controller_out = LSTM(num_bits,activation = 'sigmoid')(h2)
+    controller = Model([i,read_input],[controller_out,instr_out])
+    controller.summary()
     # NTM
     i = Input((seq_len,num_bits))
     ntm_cell = NTM(
@@ -298,6 +317,7 @@ if __name__ == '__main__':
             batch_size = batch_size,
             #controller_instr_output_dim = controller_instr_output_dim,
             return_sequences = True,
+            is_controller_recurrent = True,
             num_read = num_read,num_write = num_write)(i)
     ntm = Model(i,ntm_cell)
     print("****************** Start Training *****************")
@@ -334,7 +354,7 @@ if __name__ == '__main__':
     # for visualizations
     #grad = K.gradients(ntm.outputs[0],controller.trainable_weights)
  
-    finetune = True
+    finetune = False
     # load the weights
     if finetune:
         print('loading models')
