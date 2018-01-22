@@ -1,7 +1,123 @@
 from keras.engine.topology import Layer
 from keras.models import Model,load_model
-from weight import _get_weight
 from keras.layers import *
+import keras.backend as K
+'''
+    File containing the necessary weights for getting weight vector given k,b,g,s,t from head
+    M: (batch,N,M)
+    k: (batch,M)
+    b: (batch,)
+    g: (batch,)
+    s: (batch,num_shift)
+'''
+DEBUG = False
+def _content_addressing(M,k,b):
+    if DEBUG:
+        assert K.ndim(M) == 3
+        assert K.ndim(k) == 2
+        assert K.ndim(b) == 1
+
+    # cosine similarity
+    nM = K.l2_normalize(M,axis = 1)     # (batch,N,M)
+    nk = K.l2_normalize(k,axis = -1)    # (batch,M)
+    nkx = K.expand_dims(nk,axis = -1)   # (batch,M,1)
+    sim = K.batch_dot(nM,nkx)           # (batch,N,1)
+
+    # multiply by b
+    bx = K.expand_dims(b,axis = -1)     # (batch,1)
+
+    mul = K.batch_dot(sim,bx)           # (batch,N)
+
+    return K.softmax(mul)               # (batch,N)
+
+
+# eq. 7 of the paper
+def _interpolate(wc,w,g):
+    if DEBUG:
+        assert K.ndim(wc) == 2 == K.ndim(w)
+        assert K.ndim(g) == 1
+    wcx = K.expand_dims(wc,axis = -1)       # (batch,N,1)
+    gx = K.expand_dims(g,axis = -1)         # (batch,1)
+    wx = K.expand_dims(w,axis = -1)         # (batch,N,1)
+    if DEBUG:
+        print('wcx:',wcx)
+        print('gx:',gx)
+        print('wx:',wx)
+    prod = K.batch_dot(wcx,gx)              # (batch,N)
+    if DEBUG:
+        print('prod',prod)
+    prod = prod + K.batch_dot(wx, 1 - gx)   # (batch,N)
+
+    return prod
+
+# eq. 8 of the paper
+'''
+    wi: weight from interpolation (eq. 7), shape (?,N)
+    s:  shifting kernel, shape (?,num_shift)
+    n:  N (n_slots)
+    num_shift: length of shifting kernel
+'''
+def _shift(wi,s):
+    if DEBUG:
+        assert type(n) == type(num_shift) == int
+        assert K.ndim(wi) == 2 == K.ndim(s)
+    num_shift = s.shape[-1].value
+
+    bound = num_shift // 2
+    head,tail = wi[:,:bound],wi[:,-bound:]
+    wi = K.concatenate([tail,wi,head])
+    wix = K.expand_dims(wi,1)              # (batch,1,N + num_shift)
+
+    st = K.permute_dimensions(s,(1,0))     # (num_shift,batch)
+    sx = K.expand_dims(st,1)               # (num_shift,1,batch)
+    wix = K.permute_dimensions(wix,(0,2,1)) # (batch,N + num_shift,1)
+    res = K.conv1d(wix,sx,data_format = 'channels_last')                 # (batch,N,batch)
+    return K.stack([res[_,:,_] for _ in range(res.shape[0].value)])
+
+# eq. 9 of the paper
+def _sharpen(ws,g):
+    if DEBUG:
+        assert K.ndim(ws) == 2
+        assert K.ndim(g) == 1
+
+    gx = K.expand_dims(g,-1)                           # (batch,1)
+    gx = K.repeat_elements(gx,ws.shape[-1],axis = 1)   # (batch,N)
+    pow = K.pow(ws,gx)
+    return pow / (K.sum(pow,axis = -1,keepdims = True) + 1e-12) # try not to divide by 0
+
+# functions for getting weights from head
+def _get_weight(M,w,k,b,g,s,t):
+    wc = _content_addressing(M,k,b)
+    wi = _interpolate(wc,w,g)
+    ws = _shift(wi,s)
+    w_fin  = _sharpen(ws,t)
+    return w_fin
+
+if __name__ == '__main__':
+    import numpy as np
+    # unit testing playground
+    # batch = 100
+    # n = 10
+    # m = 20
+    # num_shift = 3
+
+    # M = K.ones((batch,n,m))
+    # k = K.ones((batch,m))
+    # b = K.ones((batch,))
+    # g = K.ones((batch,))
+    # w = K.ones((batch,n))
+    # s = K.ones((batch,num_shift)) * 0.5
+    # t = K.zeros((batch,))
+    # ca = _content_addressing(M,k,b)
+    # wg = _interpolate(ca,w,g)
+    # ws = _shift(wg,s)
+    # w_fin = _sharpen(ws,t)
+    # with K.get_session().as_default():
+    #     print(w_fin.eval())
+    a = K.stack([K.variable(np.arange(_,10 + _,1)) for _ in range(5)])
+    s = K.stack([K.variable([1. + _,0,0]) for _ in range(5)])
+    with K.get_session().as_default():
+        print(_shift(a,s).eval())
 
 class NTM(Layer):
     def __init__(self,
@@ -11,6 +127,8 @@ class NTM(Layer):
         num_read,num_write,             # controller-head config
         batch_size = 16,
         controller_instr_output_dim = None,
+        is_controller_recurrent = False,
+        initial_memory = None,
         **args):                        # others
 
         self.N = n_slots
@@ -26,6 +144,8 @@ class NTM(Layer):
         self.batch_size = batch_size
         self.controller_instr_output_dim = controller_instr_output_dim
         
+        self.is_controller_recurrent = is_controller_recurrent 
+        self.initial_memory = initial_memory
         if 'return_sequences' in args:
             self.return_sequences = args['return_sequences']
             del args['return_sequences']
@@ -221,17 +341,26 @@ class NTM(Layer):
         k,b = self._construct_head_weights()
         self.kernel = k
         self.bias = b
+        
+        self.built = True
 
     def compute_output_shape(self, input_shape):
         seq_len = input_shape[1]
+        single_step_input_shape = [s for i,s in enumerate(input_shape) if i != 1]
+        
         read_vector_input_shape = (input_shape[0],self.num_read,self.M)
-        controller_output_shape, _ = self.controller.compute_output_shape([input_shape,read_vector_input_shape])
-
+        controller_output_shape, _ = self.controller.compute_output_shape([single_step_input_shape,read_vector_input_shape])
+        '''
         if not self.return_sequences:
             controller_output_shape = list(controller_output_shape)
             del controller_output_shape[1]
             controller_output_shape = tuple(controller_output_shape)
-
+        '''
+        if self.return_sequences:
+            controller_output_shape = list(controller_output_shape)
+            controller_output_shape.insert(1,seq_len)
+            controller_output_shape = tuple(controller_output_shape)
+        
         return controller_output_shape
 
     def call(self,x):
@@ -244,6 +373,7 @@ class NTM(Layer):
 
     def save_states(self,states):
         read_vectors,read_weights,write_weights,M = states
+        # TODO: what then?
         
     def get_initial_states(self,x):
         batch_size = self.batch_size
@@ -253,134 +383,15 @@ class NTM(Layer):
         read_weights = K.zeros((batch_size,self.num_read,self.N))
         # write_weights = [K.zeros((batch_size,self.N)) for i in range(self.num_write)]
         write_weights = K.zeros((batch_size,self.num_write,self.N))
-        # # TODO: memory initializations?
-        #M = np.random.rand(batch_size,self.N,self.M)/ 100.
-        M = np.zeros((batch_size,self.N,self.M))
-        M[:,self.N // 2,:] = np.ones((batch_size,self.M))
-        M = K.variable(M)
-
+        
+        if None is self.initial_memory:
+            M = np.zeros((batch_size,self.N,self.M))
+            M[:,self.N // 2,:] = np.ones((batch_size,self.M))
+            M = K.variable(M)
+        else:
+            M = K.variable(self.initial_memory)
+            
         read_vectors = K.stack(read_vectors,axis = 1)
 
         return [read_vectors,read_weights,write_weights,M]
 
-from keras.models import Model
-import csv
-if __name__ == '__main__':
-    min_len = 90
-    max_len = 90
-    seq_len = 2 * max_len + 1
-    num_bits = 8
-
-    num_read = 1
-    num_write = 1
-
-    num_slots = 128
-    mem_length = num_bits
-    batch_size = 4
-
-    controller_instr_output_dim = num_bits + num_read * mem_length
-    # controller
-    i = Input((num_bits,))
-    read_input = Input((num_read,mem_length))
-    read_input_flatten = Flatten()(read_input)
-    h = Concatenate()([i,read_input_flatten])
-    h2 = Dense(100,activation = 'tanh')(h)
-    controller_out = Dense(num_bits,activation = 'sigmoid')(h2)
-    controller = Model([i,read_input],[controller_out,h2])
-    controller.summary()
-    
-    # NTM
-    i = Input((seq_len,num_bits))
-    ntm_cell = NTM(
-            controller,                     # custom controller, should output a vector
-            num_slots,mem_length,           # Memory config
-            num_shift = 3,                  # shifting
-            batch_size = batch_size,
-            #controller_instr_output_dim = controller_instr_output_dim,
-            return_sequences = True,
-            num_read = num_read,num_write = num_write)(i)
-    ntm = Model(i,ntm_cell)
-    print("****************** Start Training *****************")
-    def copy_task_generator(batch_size = 16,min_len = 1,max_len = 20,num_bits = 8):
-        while True:
-            res = np.zeros((batch_size,max_len * 2 + 1,num_bits + 1))
-            output = np.zeros((batch_size,max_len * 2 + 1,num_bits + 1))
-            mask = np.zeros((batch_size,max_len * 2 + 1))
-            for bs in range(batch_size):
-                l = np.random.randint(min_len,max_len + 1)
-                for i in range(l):
-                    for j in range(num_bits):
-                        res[bs,i,j] = np.random.randint(2)
-                # delim flag
-                res[bs,l,num_bits] = 1.
-                # output = np.zeros((max_len * 2 + 1, num_bits + 1))
-                output[bs,l + 1:2 * l + 1,:] = res[bs,:l,:]
-                output[bs,l,-1] = 1.
-                mask[bs,l + 1: 2 * l + 1] = 1.
-            yield (res,output,mask)
-    from keras.optimizers import RMSprop,Adam
-    import sys
-    ntm.compile(loss = 'binary_crossentropy',
-        metrics = ['binary_accuracy'],
-        optimizer = RMSprop(1e-3,clipnorm = 1.),
-        sample_weight_mode = 'temporal')
-    epochs = 200
-    steps = 500
-    data_gen = copy_task_generator(
-        num_bits = num_bits - 1,
-        min_len = min_len,
-        max_len = max_len,
-        batch_size = batch_size)
-    # for visualizations
-    #grad = K.gradients(ntm.outputs[0],controller.trainable_weights)
- 
-    finetune = True
-    # load the weights
-    if finetune:
-        print('loading models')
-        ntm.load_weights('ntm_weights.h5')
-        controller = load_model('controller.h5')
-    try:
-        with open('log.csv','w') as csvf:
-            csv_writer = csv.writer(csvf)
-            for epoch in range(epochs):
-                total_loss = 0.
-                total_acc = 0.
-                print()
-                print('Epoch {}/{}:'.format(epoch,epochs))
-                for step in range(steps):
-                    inp,target,mask = data_gen.__next__()
-                    if finetune:
-                        loss,acc = ntm.evaluate(inp,target,sample_weight = mask)
-                    else:
-                        loss,acc = ntm.train_on_batch(inp,target,sample_weight = mask)
-                    total_loss += loss
-                    total_acc += acc
-                    loss = total_loss / (1 + step)
-                    acc = total_acc / (1 + step)
-                    sys.stdout.write('\rstep %d/%d,loss:%.4g,acc:%.4g,lr: %f'%(step,steps,loss,acc,K.get_value(ntm.optimizer.lr)))
-                    sys.stdout.flush()
-                    
-                    # write csv
-                    csv_writer.writerow([epoch,step,loss,acc])
-                print()
-                test_inp,test_target,test_mask = data_gen.__next__()
-                output = ntm.predict(test_inp,batch_size = batch_size)
-                # get the first batch
-                test_inp = test_inp[0]
-                output = output[0]
-                test_target = test_target[0]
-                test_mask = test_mask[0]
-                
-                # save the tensor
-                prefix = '' if not finetune else 'evaluate-'
-                np.save('{}epoch_{}-input'.format(prefix,epoch),test_inp)
-                np.save('{}epoch_{}-output'.format(prefix,epoch),output)
-                np.save('{}epoch_{}-target'.format(prefix,epoch),test_target)
-                np.save('{}epoch_{}-mask'.format(prefix,epoch),test_mask)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        if not finetune:
-            ntm.save_weights('ntm_weights.h5')
-            controller.save('controller.h5')    
