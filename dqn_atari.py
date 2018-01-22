@@ -17,7 +17,8 @@ from rl.core import Processor
 from rl.callbacks import FileLogger, ModelIntervalCheckpoint
 
 
-INPUT_SHAPE = (84, 84)
+#INPUT_SHAPE = (84,84)
+INPUT_SHAPE = (32,32)
 WINDOW_LENGTH = 4
 batch_size = 1
 
@@ -45,7 +46,8 @@ class AtariProcessor(Processor):
     def process_observation(self, observation):
         assert observation.ndim == 3  # (height, width, channel)
         img = Image.fromarray(observation)
-        img = img.resize(INPUT_SHAPE).convert('L')  # resize and convert to grayscale
+        #img = img.resize(INPUT_SHAPE).convert('L')  # resize and convert to grayscale
+        img = img.resize(INPUT_SHAPE).convert('1')   # resize and convert to black and white
         processed_observation = np.array(img)
         assert processed_observation.shape == INPUT_SHAPE
         return processed_observation.astype('uint8')  # saves storage in experience memory
@@ -130,9 +132,9 @@ def get_ntm_model():
     import keras.backend as K
 
     assert permute_layer is not None 
-    num_read = 5
-    num_write = 5
-    mem_length = 128
+    num_read = 2
+    num_write = 2
+    mem_length = 80
     n_slots = 128
     
     model_input = Input(
@@ -141,10 +143,10 @@ def get_ntm_model():
     )
     
     per = permute_layer(model_input)
-    
-    x = TimeDistributed(Conv2D(32,(8,8),name='conv1',activation = 'relu',subsample = (4,4)))(per)
-    x = TimeDistributed(Conv2D(64,(4,4),name='conv2',activation = 'relu',subsample = (2,2)))(x)
-    x = TimeDistributed(Conv2D(64,(3,3),name='conv3',activation = 'relu',subsample = (1,1)))(x)
+    x = TimeDistributed(Conv2D(32,(5,5),subsample = (5,5),name = 'conv',activation = 'relu'))(per)
+    x = TimeDistributed(Conv2D(32,(3,3),name='conv1',activation = 'relu'))(x)
+    #x = TimeDistributed(Conv2D(64,(4,4),name='conv2',activation = 'relu',subsample = (2,2)))(x)
+    #x = TimeDistributed(Conv2D(64,(3,3),name='conv3',activation = 'relu',subsample = (1,1)))(x)
     x = TimeDistributed(Flatten(name = "Flatten1"))(x) # (batch_size,WINDOW_LENGTH,3176)
     x_shape = K.int_shape(x)
     print('x has shape:',x_shape)
@@ -155,11 +157,11 @@ def get_ntm_model():
     print('controller_inp shape:',controller_inp.shape)
     #print('read_inp_flatten shape:',K.int_shape(read_inp_flatten))
     #print('read_inp_flatten_repeat shape:',K.int_shape(read_inp_flatten_repeat))
-    
-    concat = Concatenate(name="ctrl_inp_read_inp_concat")([controller_inp,read_inp_flatten]) # (batch_size, 3176 + num_read * mem_length)
-    hidden = Dense(512,activation = 'relu')(concat)
+    #hidden_int = Dense(512,activation = 'relu')(controller_inp)
+    hidden = Concatenate(name="ctrl_inp_read_inp_concat")([controller_inp,read_inp_flatten]) # (batch_size, 3176 + num_read * mem_length)
+    #hidden = Dense(512,activation = 'relu')(concat)
     controller_output = Dense(nb_actions,activation = 'linear')(hidden)
-    controller = Model([controller_inp,read_inp],[controller_output,hidden])
+    controller = Model([controller_inp,read_inp],[controller_output,controller_inp])
     controller.summary()
     # ntm constuction
     #TODO: reset the state for on_batch_end!!
@@ -204,8 +206,8 @@ processor = AtariProcessor()
 # the agent initially explores the environment (high eps) and then gradually sticks to what it knows
 # (low eps). We also set a dedicated eps value that is used during testing. Note that we set it to 0.05
 # so that the agent still performs some random actions. This ensures that the agent cannot get stuck.
-policy = LinearAnnealedPolicy(EpsGreedyQPolicy(), attr='eps', value_max=1., value_min=.02, value_test=.02,
-                              nb_steps=100000)
+policy = LinearAnnealedPolicy(EpsGreedyQPolicy(), attr='eps', value_max=1., value_min=.1, value_test=.02,
+                              nb_steps=1000000)
 
 # The trade-off between exploration and exploitation is difficult and an on-going research topic.
 # If you want, you can experiment with the parameters or use a different policy. Another popular one

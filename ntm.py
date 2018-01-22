@@ -366,7 +366,7 @@ class NTM(Layer):
     def call(self,x):
         # add the weights here
         self.trainable_weights += self.controller.trainable_weights
-        last_output,list_outputs,states = K.rnn(self.main_step_func,x,self.get_initial_states(x))
+        last_output,list_outputs,states = K.rnn(self.main_step_func,x,self.get_initial_states(x),unroll = False)
         # plot the states
         self.save_states(states)
         return last_output if not self.return_sequences else list_outputs
