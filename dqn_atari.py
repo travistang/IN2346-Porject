@@ -17,8 +17,8 @@ from rl.core import Processor
 from rl.callbacks import FileLogger, ModelIntervalCheckpoint
 
 
-#INPUT_SHAPE = (84,84)
-INPUT_SHAPE = (32,32)
+INPUT_SHAPE = (84,84)
+#INPUT_SHAPE = (80,80)
 WINDOW_LENGTH = 4
 batch_size = 1
 
@@ -47,7 +47,7 @@ class AtariProcessor(Processor):
         assert observation.ndim == 3  # (height, width, channel)
         img = Image.fromarray(observation)
         #img = img.resize(INPUT_SHAPE).convert('L')  # resize and convert to grayscale
-        img = img.resize(INPUT_SHAPE).convert('1')   # resize and convert to black and white
+        img = img.resize(INPUT_SHAPE).convert('L')   # resize and convert to black and white
         processed_observation = np.array(img)
         assert processed_observation.shape == INPUT_SHAPE
         return processed_observation.astype('uint8')  # saves storage in experience memory
@@ -132,9 +132,9 @@ def get_ntm_model():
     import keras.backend as K
 
     assert permute_layer is not None 
-    num_read = 2
-    num_write = 2
-    mem_length = 80
+    num_read = 1
+    num_write = 1
+    mem_length = 40
     n_slots = 128
     
     model_input = Input(
@@ -143,8 +143,9 @@ def get_ntm_model():
     )
     
     per = permute_layer(model_input)
-    x = TimeDistributed(Conv2D(32,(5,5),subsample = (5,5),name = 'conv',activation = 'relu'))(per)
-    x = TimeDistributed(Conv2D(32,(3,3),name='conv1',activation = 'relu'))(x)
+    x = TimeDistributed(Conv2D(32,(8,8),name='conv1',activation = 'relu',subsample = (4,4)))(per)
+    x = TimeDistributed(Conv2D(64,(4,4),name='conv2',activation = 'relu',subsample = (2,2)))(x)
+    x = TimeDistributed(Conv2D(64,(3,3),name='conv3',activation = 'relu',subsample = (1,1)))(x)
     #x = TimeDistributed(Conv2D(64,(4,4),name='conv2',activation = 'relu',subsample = (2,2)))(x)
     #x = TimeDistributed(Conv2D(64,(3,3),name='conv3',activation = 'relu',subsample = (1,1)))(x)
     x = TimeDistributed(Flatten(name = "Flatten1"))(x) # (batch_size,WINDOW_LENGTH,3176)
@@ -236,7 +237,7 @@ else:
 import tensorflow as tf
 def get_optimizer():
     if use_rnn:
-        return Adam(1e-5,clipnorm = 1.)
+        return Adam(1e-4)
     else:
         return Adam(1e-4)
 dqn.compile(get_optimizer(), metrics=['mae'])
